@@ -1,0 +1,229 @@
+name: Release
+
+# Publishes one Growbud Edge Server release:
+#
+#   ghcr.io/growbud-io/edge/<name>:<version>   the nine public images
+#   github.com/growbud-io/edge/releases        the signed install bundle
+#
+# The images are built, scanned and gated in Growbud's private repository,
+# which pushes them as private release candidates with a release kit:
+#
+#   <SOURCE_NAMESPACE>/<name>:<version>
+#   <SOURCE_NAMESPACE>/growbud-edge-release:<version>
+#
+# This workflow checks the candidates' signatures, copies each image here by
+# digest (the bytes do not change), and signs the images and the bundle with
+# this workflow's keyless identity. Customers verify against that identity.
+#
+# Run it from main:  gh workflow run release.yml -R growbud-io/edge -f version=5.3.9
+#
+# Secrets (GitHub masks each in the logs):
+#   SOURCE_GHCR_TOKEN  a classic token with read:packages only, from an account
+#                      that can read the candidates. Nothing here writes there.
+#   SOURCE_NAMESPACE   the registry namespace of the private candidates.
+#   SOURCE_SIGNER      the certificate identity regexp of the private build.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (SemVer, e.g. 5.3.9)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    # Explicit bash adds -o pipefail; the default shell does not.
+    shell: bash
+
+env:
+  SOURCE: ${{ secrets.SOURCE_NAMESPACE }}
+  TARGET: ghcr.io/growbud-io/edge
+  SOURCE_SIGNER: ${{ secrets.SOURCE_SIGNER }}
+  ISSUER: https://token.actions.githubusercontent.com
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Check the version
+        run: |
+          if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid SemVer version: $VERSION"
+            exit 1
+          fi
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::v$VERSION is already released. A release never changes."
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.7.0
+        with:
+          cosign-release: 'v2.4.1'
+
+      - name: Install ORAS
+        uses: oras-project/setup-oras@v1
+        with:
+          version: 1.2.3
+
+      # Source and target are both ghcr.io, so each gets its own credential
+      # file. The token that reads the candidates never pushes here.
+      - name: Log in to both registries
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_GHCR_TOKEN }}
+          TARGET_TOKEN: ${{ github.token }}
+        run: |
+          for secret in SOURCE_TOKEN SOURCE SOURCE_SIGNER; do
+            if [ -z "${!secret}" ]; then
+              echo "::error::A SOURCE_* secret is not set ($secret)"
+              exit 1
+            fi
+          done
+          SRC="$RUNNER_TEMP/src-auth"
+          DST="$RUNNER_TEMP/dst-auth"
+          mkdir -p "$SRC" "$DST"
+          echo "$SOURCE_TOKEN" | docker --config "$SRC" login ghcr.io -u token --password-stdin
+          echo "$TARGET_TOKEN" | docker --config "$DST" login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          echo "SRC=$SRC" >> "$GITHUB_ENV"
+          echo "DST=$DST" >> "$GITHUB_ENV"
+
+      - name: Fetch and check the release kit
+        run: |
+          kit="$SOURCE/growbud-edge-release"
+          digest="$(oras resolve --registry-config "$SRC/config.json" "$kit:$VERSION")"
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "::error::No release kit for $VERSION"; exit 1; }
+          DOCKER_CONFIG="$SRC" cosign verify \
+            --certificate-identity-regexp "$SOURCE_SIGNER" --certificate-oidc-issuer "$ISSUER" \
+            "$kit@$digest" > /dev/null
+          KIT="$RUNNER_TEMP/kit"
+          oras pull --registry-config "$SRC/config.json" -o "$KIT" "$kit@$digest"
+          cd "$KIT"
+          ls -l
+
+          NAME="growbud-edge-$VERSION.tar.gz"
+          CANDIDATES="growbud-edge-images-$VERSION.txt"
+          PROMOTED="growbud-edge-images-$VERSION.promoted.txt"
+          for f in "$NAME" "$CANDIDATES" "$CANDIDATES.sigstore.json" "$PROMOTED" install.sh; do
+            [ -s "$f" ] || { echo "::error::The kit has no $f"; exit 1; }
+          done
+          cosign verify-blob --bundle "$CANDIDATES.sigstore.json" \
+            --certificate-identity-regexp "$SOURCE_SIGNER" --certificate-oidc-issuer "$ISSUER" \
+            "$CANDIDATES"
+
+          # The promoted list is the candidate list with only the namespace
+          # changed: same nine names, same version, same digests.
+          want="$(grep -v '^#' "$CANDIDATES" | sed "s|^$SOURCE/|$TARGET/|")"
+          got="$(grep -v '^#' "$PROMOTED")"
+          if [ "$want" != "$got" ] || [ "$(printf '%s\n' "$got" | grep -c "^$TARGET/growbud-[a-z-]*:$VERSION@sha256:[a-f0-9]\{64\}$")" != 9 ]; then
+            echo "::error::$PROMOTED does not match $CANDIDATES"
+            exit 1
+          fi
+
+          # The bundle must install exactly these images from here.
+          top="growbud-edge-$VERSION"
+          [ "$(tar -xzOf "$NAME" "$top/REGISTRY")" = "$TARGET" ] || { echo "::error::Bundle REGISTRY is not $TARGET"; exit 1; }
+          [ "$(tar -xzOf "$NAME" "$top/VERSION")" = "$VERSION" ] || { echo "::error::Bundle VERSION is not $VERSION"; exit 1; }
+          tar -xzOf "$NAME" "$top/IMAGE-DIGESTS.txt" | cmp -s - "$PROMOTED" \
+            || { echo "::error::Bundle IMAGE-DIGESTS.txt does not match $PROMOTED"; exit 1; }
+          bash -n install.sh
+
+          {
+            echo "KIT=$KIT"
+            echo "NAME=$NAME"
+            echo "CANDIDATES=$CANDIDATES"
+            echo "PROMOTED=$PROMOTED"
+          } >> "$GITHUB_ENV"
+
+      - name: Install skopeo
+        run: |
+          if ! command -v skopeo >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq skopeo
+          fi
+          skopeo --version
+
+      - name: Copy and sign the images
+        run: |
+          while IFS= read -r ref; do
+            name="${ref#"$SOURCE/"}"
+            name="${name%%:*}"
+            digest="${ref##*@}"
+            echo "::group::$name@$digest"
+            DOCKER_CONFIG="$SRC" cosign verify \
+              --certificate-identity-regexp "$SOURCE_SIGNER" --certificate-oidc-issuer "$ISSUER" \
+              "$SOURCE/$name@$digest" > /dev/null
+            # --preserve-digests: the copy holds the bytes that were gated, or fails.
+            skopeo copy --all --preserve-digests --retry-times 3 \
+              --src-authfile "$SRC/config.json" --dest-authfile "$DST/config.json" \
+              "docker://$SOURCE/$name@$digest" "docker://$TARGET/$name:$VERSION"
+            copied="$(skopeo inspect --raw --authfile "$DST/config.json" "docker://$TARGET/$name:$VERSION" | sha256sum | cut -d' ' -f1)"
+            [ "sha256:$copied" = "$digest" ] || { echo "::error::$name copied as sha256:$copied, expected $digest"; exit 1; }
+            # --recursive signs the index and each manifest in it.
+            DOCKER_CONFIG="$DST" cosign sign --yes --recursive "$TARGET/$name@$digest"
+            DOCKER_CONFIG="$DST" cosign verify \
+              --certificate-identity "https://github.com/$GITHUB_WORKFLOW_REF" --certificate-oidc-issuer "$ISSUER" \
+              "$TARGET/$name@$digest" > /dev/null
+            echo "::endgroup::"
+          done < <(grep -v '^#' "$KIT/$CANDIDATES")
+
+      - name: Sign the bundle and the image list
+        run: |
+          OUT="$RUNNER_TEMP/out"
+          mkdir -p "$OUT"
+          LIST="growbud-edge-images-$VERSION.txt"
+          cp "$KIT/$NAME" "$KIT/install.sh" "$OUT/"
+          cp "$KIT/$PROMOTED" "$OUT/$LIST"
+          cd "$OUT"
+          sha256sum "$NAME" > "$NAME.sha256"
+          cosign sign-blob --yes --bundle "$NAME.cosign.bundle" "$NAME" > /dev/null
+          cosign sign-blob --yes --bundle "$LIST.sigstore.json" "$LIST" > /dev/null
+          for f in "$NAME:$NAME.cosign.bundle" "$LIST:$LIST.sigstore.json"; do
+            cosign verify-blob --bundle "${f#*:}" \
+              --certificate-identity "https://github.com/$GITHUB_WORKFLOW_REF" --certificate-oidc-issuer "$ISSUER" \
+              "${f%%:*}"
+          done
+          ls -l
+          echo "OUT=$OUT" >> "$GITHUB_ENV"
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd "$OUT"
+          {
+            echo "Install or upgrade on Linux or macOS:"
+            echo
+            echo '```bash'
+            echo 'curl -fsSL https://growbud.io/edge/install.sh | sudo bash'
+            echo '```'
+            echo
+            echo "Images (linux/amd64 and linux/arm64), pinned by digest:"
+            echo
+            echo '```'
+            grep -v '^#' "growbud-edge-images-$VERSION.txt"
+            echo '```'
+            echo
+            echo "See the README to verify the signatures. Use is subject to the EULA."
+          } > notes.md
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Growbud Edge Server $VERSION" --notes-file notes.md \
+            "$NAME" "$NAME.sha256" "$NAME.cosign.bundle" install.sh \
+            "growbud-edge-images-$VERSION.txt" "growbud-edge-images-$VERSION.txt.sigstore.json"
